@@ -1,0 +1,7 @@
+[project]
+name = "mas-homework"
+version = "0.1.0"
+description = "A ReAct‑style agent prototype for academic literature processing: lists PDFs, extracts metadata (authors & affiliations), parses sections, analyzes themes and methods between papers, performs English abstract extraction and Chinese translation, and generates reading‑comprehension QA sets."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
