@@ -1,7 +1,8 @@
 # src/mas_homework/tools/pdf_tools.py
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, cast
 
 import fitz  # PyMuPDF
 
@@ -9,13 +10,75 @@ from ..tool_system import GLOBAL_TOOLS, tool
 from ..types import ToolResult
 
 
+def _parse_pages_input(pages_input: str, max_page: int) -> List[int]:
+    """
+    解析页码输入字符串为合法的 0-indexed 页码列表。
+    支持单页（"1"）、列表（"1,3,5"）和范围（"2-5"）。
+    """
+    if isinstance(pages_input, int):
+        pages_input = str(pages_input)
+
+    pages_input = pages_input.strip()
+    valid_pages = set()
+    parts = re.split(r",\s*", pages_input)
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if re.match(r"^\d+$", part):
+            p = int(part)
+            if 1 <= p <= max_page:
+                valid_pages.add(p)
+        elif re.match(r"^\d+-\d+$", part):
+            try:
+                start, end = map(int, part.split("-"))
+                if start > end:
+                    start, end = end, start
+                for p in range(start, end + 1):
+                    if 1 <= p <= max_page:
+                        valid_pages.add(p)
+            except ValueError:
+                continue
+
+    return sorted([p - 1 for p in valid_pages])
+
+
 @tool(
     GLOBAL_TOOLS,
-    "pdf_read",
-    "Read a specific page from a PDF file. Parameter 'page' is 1-indexed. Returns the first 10 lines as a snippet.",
+    "pdf_pages",
+    """Extract text content from specific pages of a PDF.
+
+Parameters:
+- path (str): Path to the PDF file.
+- pages (str): Pages to extract, supports:
+    1. Single page, e.g., "3"
+    2. Comma-separated list, e.g., "1,3,5"
+    3. Page range, e.g., "2-5"
+    4. Combination, e.g., "1,3-4,6"
+
+Returns:
+- ToolResult:
+    success (bool): Whether the extraction succeeded.
+    output (str): Extracted text from the specified pages, with each page prefixed by "--- Page X/Y ---".
+    error (str | None): Error message if failed.
+
+Examples:
+1. Extract a single page:
+    pdf_pages(path="report.pdf", pages="2")
+
+2. Extract multiple non-contiguous pages:
+    pdf_pages(path="report.pdf", pages="1,3,5")
+
+3. Extract a range of pages:
+    pdf_pages(path="report.pdf", pages="2-4")
+
+4. Extract a combination:
+    pdf_pages(path="report.pdf", pages="1,3-5,7")
+""",
 )
-def pdf_read(path: str, page: int = 1) -> ToolResult:
-    """读取 PDF 文件指定页面的内容，仅返回前十行作为摘要"""
+def pdf_pages(path: str, pages: str) -> ToolResult:
     pdf_path = Path(path)
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
         return ToolResult(
@@ -24,56 +87,40 @@ def pdf_read(path: str, page: int = 1) -> ToolResult:
 
     try:
         doc = fitz.open(pdf_path.as_posix())
-        if page < 1 or page > doc.page_count:
+        max_page = doc.page_count
+        page_indices = _parse_pages_input(pages, max_page)
+
+        if not page_indices:
             doc.close()
             return ToolResult(
                 success=False,
-                error=f"Page {page} out of range. Document has {doc.page_count} pages.",
+                error=f"No valid pages found in input '{pages}'. Document has {max_page} pages.",
             )
 
-        text = doc.load_page(page - 1).get_text("text")
-        doc.close()
-        snippet = "\n".join(text.splitlines()[:10])
-        output = f"Content of page {page} in '{path}' (Total {len(text.splitlines())} lines):\n{snippet}\n..."
-        return ToolResult(success=True, output=output)
+        extracted_texts = []
+        for index in page_indices:
+            text = cast(str, doc.load_page(index).get_text("text"))
+            page_num = index + 1
+            extracted_texts.append(f"--- Page {page_num}/{max_page} ---\n{text}")
 
-    except Exception as e:
-        return ToolResult(
-            success=False, error=f"Error reading PDF: {type(e).__name__}: {e}"
-        )
-
-
-@tool(
-    GLOBAL_TOOLS,
-    "pdf_text",
-    "Extract all text content from a PDF file. Output can be large. Use only if partial reading is insufficient.",
-)
-def pdf_text(path: str) -> ToolResult:
-    """提取整个 PDF 文件的文本内容"""
-    pdf_path = Path(path)
-    if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
-        return ToolResult(
-            success=False, error=f"Invalid or non-existent PDF file: '{path}'"
-        )
-
-    try:
-        doc = fitz.open(pdf_path.as_posix())
-        full_text = [doc.load_page(i).get_text("text") for i in range(doc.page_count)]
         doc.close()
 
-        output = "\n".join(full_text)
+        output = "\n\n".join(extracted_texts)
         MAX_TEXT_LEN = 10000
         if len(output) > MAX_TEXT_LEN:
             output = (
                 output[:MAX_TEXT_LEN]
-                + f"\n\n[TRUNCATED] Text truncated to {MAX_TEXT_LEN} characters."
+                + f"\n\n[TRUNCATED] Text truncated to {MAX_TEXT_LEN} characters. Total pages extracted: {len(page_indices)}."
             )
+
         return ToolResult(success=True, output=output)
 
     except Exception as e:
+        doc_obj = locals().get("doc")
+        if doc_obj is not None and not doc_obj.is_closed:
+            doc_obj.close()
         return ToolResult(
-            success=False,
-            error=f"Error extracting full text from PDF: {type(e).__name__}: {e}",
+            success=False, error=f"Error reading PDF: {type(e).__name__}: {e}"
         )
 
 
@@ -83,7 +130,6 @@ def pdf_text(path: str) -> ToolResult:
     "Extract structured metadata (Title, Author, Creation Date, Page Count, and first page snippet) from a PDF file.",
 )
 def pdf_meta(path: str) -> ToolResult:
-    """提取 PDF 文件元数据，返回结构化 JSON"""
     pdf_path = Path(path)
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
         return ToolResult(
@@ -94,11 +140,11 @@ def pdf_meta(path: str) -> ToolResult:
         doc = fitz.open(pdf_path.as_posix())
         metadata = doc.metadata or {}
         page_count = doc.page_count
-        first_page_text = doc.load_page(0).get_text("text")
+        first_page_text = cast(str, doc.load_page(0).get_text("text"))
         doc.close()
 
         abstract_snippet = "\n".join(first_page_text.splitlines()[:20])
-        meta_data_output = {
+        meta_data_output: Dict[str, Any] = {
             "file": path,
             "title": metadata.get("title", "N/A"),
             "author": metadata.get("author", "N/A"),
@@ -106,12 +152,16 @@ def pdf_meta(path: str) -> ToolResult:
             "page_count": page_count,
             "first_page_snippet": abstract_snippet,
         }
+
         return ToolResult(
             success=True,
             output=json.dumps(meta_data_output, ensure_ascii=False, indent=4),
         )
 
     except Exception as e:
+        doc_obj = locals().get("doc")
+        if doc_obj is not None and not doc_obj.is_closed:
+            doc_obj.close()
         return ToolResult(
             success=False,
             error=f"Error extracting metadata from '{path}': {type(e).__name__}: {e}",
