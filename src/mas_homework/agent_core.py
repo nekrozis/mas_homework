@@ -25,7 +25,7 @@ class Agent:
     def _format_history_for_debug(
         self, history: List[StepRecord]
     ) -> List[Dict[str, Any]]:
-        """格式化历史记录，便于调试输出"""
+        """格式化历史记录，便于调试"""
         debug_history = []
         for step in history:
             item: Dict[str, Any] = {
@@ -37,24 +37,22 @@ class Agent:
                 item["action"] = step.tool_name
                 item["args"] = step.tool_args
             if step.observation:
-                # 限制 Observation 长度，避免输出过长
-                obs = step.observation
-                item["observation"] = obs if len(obs) < 500 else obs[:500] + "..."
-
+                item["observation"] = (
+                    step.observation[:500] + "..."
+                    if len(step.observation) > 500
+                    else step.observation
+                )
             debug_history.append(item)
         return debug_history
 
     def _format_messages(self, state: AgentState) -> List[Dict[str, str]]:
-        """构建发送给 LLM 的消息历史"""
+        """构建发送给 LLM 的消息列表"""
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": self._get_system_prompt()},
             {"role": "user", "content": state.user_query},
         ]
-
-        # 将历史记录中的 Thought, Action, Observation 转换为 LLM 格式
         for step in state.history:
             if step.thought:
-                # 构建 LLM 响应的 JSON 内容
                 llm_content: Dict[str, Any] = {"thought": step.thought}
                 if step.tool_name:
                     llm_content["tool_call"] = {
@@ -62,277 +60,162 @@ class Agent:
                         "arguments": step.tool_args or {},
                     }
                 elif step.status == "COMPLETED":
-                    # 在最终答案步骤，LLM的输出是 Thought + Final Answer
-                    # 注意：此时 state.final_answer 应该已经设置
                     llm_content["final_answer"] = state.final_answer or ""
-
-                # LLM 响应：将复杂字典转为 JSON 字符串，满足 List[Dict[str, str]] 要求
                 messages.append(
                     {"role": "assistant", "content": json.dumps(llm_content)}
                 )
-
             if step.observation:
-                # 工具执行结果 (Observation)
                 messages.append({"role": "tool_result", "content": step.observation})
-
         return messages
 
     def _get_system_prompt(self) -> str:
-        """生成系统提示词，包含工具说明"""
-        # 依赖 tool_system.get_tool_descriptions() (已在 tool_system.py 中修复)
         tool_desc = self.tool_system.get_tool_descriptions()
         return (
             "You are a sophisticated document analysis assistant. Your task is to process a PDF file "
             "based on the user's query and provide a structured JSON response in the FINAL_ANSWER format.\n\n"
-            "You MUST follow the ReAct pattern: Thought, then Action (tool_call) OR Final Answer (final_answer).\n"
+            "Follow the ReAct pattern: Thought, then Action (tool_call) OR Final Answer (final_answer).\n"
             "Your output MUST be a single JSON object containing 'thought' and EITHER 'tool_call' OR 'final_answer'.\n\n"
-            "Tool Descriptions:\n"
-            f"{tool_desc}\n\n"
+            f"Tool Descriptions:\n{tool_desc}\n\n"
             "JSON Output Format Requirements:\n"
-            "1. Tool Call Example:\n"
-            '   {"thought": "I need to find files.", "tool_call": {"name": "ls", "arguments": {"path_or_pattern": "*.pdf"} }}\n'
-            "2. Final Answer Example (MUST contain the final JSON structure for the user query):\n"
-            '   {"thought": "I have gathered all data.", "final_answer": "{{ ... final JSON analysis ... }}"}\n'
+            'Tool Call Example: {"thought": "I need to find files.", "tool_call": {"name": "ls", "arguments": {"path_or_pattern": "*.pdf"} }}\n'
+            'Final Answer Example: {"thought": "I have gathered all data.", "final_answer": "{ ... final JSON analysis ... }"}\n'
             "The final_answer value must be a string containing a complete JSON object."
         )
 
     def _parse_llm_response(
         self, llm_response: LLMResponse
     ) -> Tuple[LLMParsedContent, Optional[str]]:
-        """解析 LLM 的 JSON 响应，并返回解析后的内容和错误（如果有）"""
-        raw_content = llm_response.message.content
-        if not raw_content:
-            return LLMParsedContent(thought="Error"), "LLM returned empty content."
-
-        # === 修复点：鲁棒性 JSON 提取 (查找第一个 '{' 和最后一个 '}') ===
-        data_to_load = raw_content.strip()
-
-        # 查找第一个 '{' 和最后一个 '}' 的索引
-        start_index = data_to_load.find("{")
-        end_index = data_to_load.rfind("}")
-
+        """解析 LLM JSON 响应"""
+        raw_content = llm_response.message.content or ""
+        start_index = raw_content.find("{")
+        end_index = raw_content.rfind("}")
         if start_index == -1 or end_index == -1 or start_index > end_index:
-            # 如果找不到合法的 JSON 边界，则报告解码失败
-            return (
-                LLMParsedContent(thought="Error"),
-                f"Failed to find valid JSON object boundaries in LLM response: {raw_content[:100]}...",
-            )
-
-        # 截取第一个 '{' 到最后一个 '}' 之间的内容 (包含边界)
-        json_payload = data_to_load[start_index : end_index + 1]
-        # =============================================================
-
+            return LLMParsedContent(
+                thought="Error"
+            ), f"Failed to find JSON boundaries in LLM response: {raw_content[:100]}..."
+        json_payload = raw_content[start_index : end_index + 1]
         try:
-            # 尝试加载提取出的 JSON 载荷
             data = json.loads(json_payload)
-
-            # 使用 Pydantic 严格验证 LLM 的 JSON 结构
-            parsed_content = LLMParsedContent.model_validate(data)
-
-            # 额外的逻辑检查
-            has_tool = parsed_content.tool_call is not None
-            has_final = parsed_content.final_answer is not None
-
+            parsed = LLMParsedContent.model_validate(data)
+            has_tool, has_final = (
+                parsed.tool_call is not None,
+                parsed.final_answer is not None,
+            )
             if has_tool and has_final:
-                return (
-                    parsed_content,
-                    "JSON contains both 'tool_call' and 'final_answer'. Use only one.",
-                )
-
+                return parsed, "JSON contains both 'tool_call' and 'final_answer'."
             if not has_tool and not has_final:
-                return (
-                    parsed_content,
-                    "JSON contains neither 'tool_call' nor 'final_answer'.",
-                )
-
-            return parsed_content, None
-
-        except json.JSONDecodeError:
-            # 注意：这里的 raw_content 已经被替换为 json_payload，但是我们仍然使用原始的 raw_content 进行错误信息展示
+                return parsed, "JSON contains neither 'tool_call' nor 'final_answer'."
+            return parsed, None
+        except (json.JSONDecodeError, ValidationError) as e:
             return LLMParsedContent(
                 thought="Error"
-            ), f"Failed to decode JSON from LLM: {raw_content[:100]}..."
-        except ValidationError as e:
-            return LLMParsedContent(
-                thought="Error"
-            ), f"LLM JSON structure validation failed: {e}"
+            ), f"JSON parsing/validation failed: {e}"
         except Exception as e:
             return LLMParsedContent(thought="Error"), f"Unexpected parsing error: {e}"
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
-        """执行工具并返回结果"""
-        tool_name = tool_call.name
-        tool_args = tool_call.arguments
-
+        """执行工具"""
+        tool_name, tool_args = tool_call.name, tool_call.arguments
         if tool_name not in self.tool_system.tools:
             return ToolResult(
-                success=False, output=None, error=f"Unknown tool: '{tool_name}'"
+                success=False, output=None, error=f"Unknown tool: {tool_name}"
             )
-
-        # 执行工具
         try:
-            # 假设 tool_args 是 Dict[str, Any]，可以直接解包
             return self.tool_system.run_tool(tool_name, **tool_args)
         except Exception as e:
             return ToolResult(
-                success=False,
-                output=None,
-                error=f"Tool '{tool_name}' failed with exception: {type(e).__name__}: {e}",
+                success=False, output=None, error=f"Tool '{tool_name}' failed: {e}"
             )
 
-    async def run(self, user_query: str) -> str:
-        """运行 ReAct 循环直到完成或达到最大步数"""
+    def _update_state(
+        self, state: AgentState, step: StepRecord, final_answer: Optional[str] = None
+    ) -> AgentState:
+        """统一更新 Agent 状态"""
+        return AgentState(
+            user_query=state.user_query,
+            history=state.history + [step],
+            iteration=state.iteration + 1,
+            final_answer=final_answer or state.final_answer,
+        )
 
-        # 使用不可变 AgentState 初始化状态
+    async def _handle_tool_result(
+        self, state: AgentState, step: StepRecord, tool_call: ToolCall
+    ) -> AgentState:
+        """执行工具并处理 finish 工具终结逻辑"""
+        result = await self._execute_tool(tool_call)
+        observation = result.output or result.error or "Tool returned no output/error."
+        status = "SUCCESS"
+        final_answer = None
+
+        if result.output and result.output.startswith("TASK_COMPLETED:"):
+            final_answer = result.output.replace("TASK_COMPLETED:", "", 1)
+            status = "COMPLETED"
+
+        step = step.model_copy(update={"observation": observation, "status": status})
+        return self._update_state(state, step, final_answer=final_answer)
+
+    async def run(self, user_query: str) -> str:
         state = AgentState(user_query=user_query)
 
         while state.iteration < self.max_steps and state.final_answer is None:
-            # 1. 构造消息并调用 LLM
+            # 1. 调用 LLM
             messages = self._format_messages(state)
             try:
                 llm_response = await self.llm_client.chat(
                     self.model, messages, format="json"
                 )
             except Exception as e:
-                # 记录 LLM 调用失败
-                error_type = type(e).__name__
-                error_msg = str(e)
-                error_obs = f"LLM client call failed: {error_type}: {error_msg[:500]}"
-
-                # 使用 Pydantic 构造新的不可变状态
-                new_history = state.history + [
-                    StepRecord(
-                        iteration=state.iteration,
-                        thought="Attempting to call LLM failed.",
-                        observation=error_obs,
-                        status="FAILED",
-                    )
-                ]
-                state = AgentState(
-                    user_query=state.user_query,
-                    history=new_history,
-                    iteration=state.iteration + 1,
+                step = StepRecord(
+                    iteration=state.iteration,
+                    thought="Attempting to call LLM failed.",
+                    observation=f"LLM client call failed: {e}",
+                    status="FAILED",
                 )
+                state = self._update_state(state, step)
                 continue
 
             # 2. 解析 LLM 响应
-            parsed_content, parse_error = self._parse_llm_response(llm_response)
-
-            # 创建当前步骤的记录 (初始化 thought/tool_name/tool_args)
-            current_step = StepRecord(
+            parsed, parse_error = self._parse_llm_response(llm_response)
+            step = StepRecord(
                 iteration=state.iteration,
-                thought=parsed_content.thought,
-                tool_name=parsed_content.tool_call.name
-                if parsed_content.tool_call
-                else None,
-                tool_args=parsed_content.tool_call.arguments
-                if parsed_content.tool_call
-                else None,
+                thought=parsed.thought,
+                tool_name=parsed.tool_call.name if parsed.tool_call else None,
+                tool_args=parsed.tool_call.arguments if parsed.tool_call else None,
             )
 
-            # 3. 处理解析错误
             if parse_error:
-                # === 修复点 1：使用 model_copy 进行不可变更新 ===
-                current_step = current_step.model_copy(
+                step = step.model_copy(
                     update={
                         "observation": f"Parsing Error: {parse_error}",
                         "status": "FAILED",
                     }
                 )
-                # ===============================================
-
-                # LLM 输出格式错误，将错误作为 Observation 反馈给 LLM
-                new_history = state.history + [current_step]
-                state = AgentState(
-                    user_query=state.user_query,
-                    history=new_history,
-                    iteration=state.iteration + 1,
-                )
+                state = self._update_state(state, step)
                 continue
 
-            # 4. 执行工具 或 确认终结
-            if parsed_content.final_answer is not None:
-                # 4a. 终结：LLM 给出最终答案 (LLM 绕过了 finish 工具)
-                # === 修复点 2：使用 model_copy 进行不可变更新 ===
-                current_step = current_step.model_copy(update={"status": "COMPLETED"})
-                # ===============================================
-
-                new_history = state.history + [current_step]
-                # 更新状态并返回最终答案
-                state = AgentState(
-                    user_query=state.user_query,
-                    history=new_history,
-                    iteration=state.iteration + 1,
-                    final_answer=parsed_content.final_answer,
+            # 3. 处理 LLM 输出
+            if parsed.final_answer is not None:
+                step = step.model_copy(update={"status": "COMPLETED"})
+                state = self._update_state(
+                    state, step, final_answer=parsed.final_answer
                 )
                 break
 
-            elif parsed_content.tool_call is not None:
-                # 4b. 工具调用：执行工具
-                tool_result = await self._execute_tool(parsed_content.tool_call)
+            if parsed.tool_call is not None:
+                state = await self._handle_tool_result(state, step, parsed.tool_call)
 
-                observation_content = (
-                    tool_result.output
-                    or tool_result.error
-                    or "Tool returned no output/error."
-                )
-                status = "SUCCESS" if tool_result.success else "FAILED"
-
-                # 检查特殊终结工具 'finish' 的结果
-                if tool_result.output and tool_result.output.startswith(
-                    "TASK_COMPLETED:"
-                ):
-                    final_answer = tool_result.output.replace("TASK_COMPLETED:", "", 1)
-                    status = "COMPLETED"
-
-                    # === 修复点 3a：使用 model_copy 进行不可变更新 (Finish 成功) ===
-                    current_step = current_step.model_copy(
-                        update={
-                            "observation": observation_content,
-                            "status": status,
-                        }
-                    )
-                    # =============================================================
-
-                    new_history = state.history + [current_step]
-                    # finish 工具执行成功，返回最终答案
-                    state = AgentState(
-                        user_query=state.user_query,
-                        history=new_history,
-                        iteration=state.iteration + 1,
-                        final_answer=final_answer,
-                    )
+                if state.final_answer is not None:
                     break
 
-                # 普通工具执行成功或失败，将 Observation 反馈给 LLM
-                # === 修复点 3b：使用 model_copy 进行不可变更新 (普通工具) ===
-                current_step = current_step.model_copy(
-                    update={
-                        "observation": observation_content,
-                        "status": status,
-                    }
-                )
-                # =========================================================
-
-                new_history = state.history + [current_step]
-                state = AgentState(
-                    user_query=state.user_query,
-                    history=new_history,
-                    iteration=state.iteration + 1,
-                )
-
-        # 循环结束，返回结果
         if state.final_answer:
             return state.final_answer
-        elif state.iteration >= self.max_steps:
-            # === 调试代码：失败时打印历史记录 ===
-            history_summary = self._format_history_for_debug(state.history)
 
-            error_details = {
+        # 超过最大步数未完成
+        return json.dumps(
+            {
                 "error": f"Agent reached maximum steps ({self.max_steps}) without providing a final answer.",
-                "last_state_history": history_summary,
-            }
-            return json.dumps(error_details, indent=4, ensure_ascii=False)
-            # === 调试代码结束 ===
-        else:
-            return json.dumps({"error": "Agent loop terminated unexpectedly."})
+                "last_state_history": self._format_history_for_debug(state.history),
+            },
+            indent=4,
+            ensure_ascii=False,
+        )
