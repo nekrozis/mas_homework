@@ -7,10 +7,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
-# 确保这些模块和类型可以被正确导入
 from .llm_client import LLMClient
 from .tool_system import GLOBAL_TOOLS, ToolResult, ToolSystem
-from .types import (  # 导入 Message 以配合 LLMResponse
+from .types import (
     AgentState,
     LLMParsedContent,
     LLMResponse,
@@ -48,7 +47,6 @@ def load_history() -> List[StepRecord]:
 def save_history(history: List[StepRecord]):
     """保存历史记录到文件"""
     try:
-        # 使用 model_dump 确保 Pydantic 对象被转换为字典
         HISTORY_FILE.write_text(
             json.dumps([s.model_dump() for s in history], ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -133,7 +131,6 @@ class Agent:
                         "arguments": step.tool_args or {},
                     }
                 elif step.status == "COMPLETED" and state.final_answer:
-                    # 确保只在 COMPLETED 状态且有 final_answer 时才输出
                     llm_content["final_answer"] = state.final_answer
 
                 messages.append(
@@ -142,8 +139,11 @@ class Agent:
 
             # 构造工具结果 (tool_result) 的观察
             if step.observation and step.status != "COMPLETED":
-                # tool_result 角色用于传递工具执行结果给 LLM
-                messages.append({"role": "tool_result", "content": step.observation})
+                observation_message = (
+                    f"Tool Observation (Status: {step.status}, Tool: {step.tool_name}):\n"
+                    f"{step.observation}"
+                )
+                messages.append({"role": "user", "content": observation_message})
 
         # 当前用户查询
         messages.append({"role": "user", "content": state.user_query})
@@ -226,10 +226,7 @@ class Agent:
 
     async def run(self, user_query: str) -> str:
         """Agent 主循环"""
-
-        # 1. 加载历史并初始化状态
         history = load_history()
-        # 将用户查询作为历史记录中的最新一步，并基于历史长度设置迭代次数
         state = AgentState(
             user_query=user_query, history=history, iteration=len(history)
         )
@@ -238,10 +235,34 @@ class Agent:
         write_log(f"Starting run loop for query: {user_query}")
 
         while state.iteration < self.max_steps and state.final_answer is None:
-            # 迭代次数增加放在循环开始，确保 history 长度正确
             state = state.model_copy(update={"iteration": state.iteration + 1})
 
-            # 准备消息，包含历史
+            if state.iteration > 2 and len(state.history) >= 2:
+                last_entry = state.history[-1]
+                prev_entry = state.history[-2]
+
+                last_call = last_entry.tool_call
+                prev_call = prev_entry.tool_call
+
+                is_call_repeated_successfully = (
+                    last_call
+                    and prev_call
+                    and last_call.name == prev_call.name
+                    and last_call.arguments == prev_call.arguments
+                    and last_entry.status == "SUCCESS"
+                )
+
+                if is_call_repeated_successfully:
+                    state = state.model_copy(
+                        update={
+                            "error": f"Agent repeated tool call '{last_call.name}' after SUCCESS. Loop detected."
+                        }
+                    )
+                    write_log(
+                        f"LOOP DETECTED (SUCCESS): Tool call '{last_call.name}' repeated consecutively after SUCCESS. Aborting."
+                    )
+                    break
+
             messages = self._format_messages(state)
 
             print(f"\n[AGENT] Step {state.iteration}. Thinking...")
@@ -265,12 +286,10 @@ class Agent:
                     update={"history": state.history + [current_step]}
                 )
                 write_log(f"LLM call exception: {error_obs}")
-                break  # LLM 客户端失败，直接退出
+                break
 
-            # 3. 解析 LLM 输出
             parsed_content, parse_error = self._parse_llm_response(llm_response)
 
-            # 打印 LLM Thought
             print(f"[Thought] {parsed_content.thought}")
 
             current_step = StepRecord(
@@ -285,7 +304,6 @@ class Agent:
             )
 
             if parse_error:
-                # 4a. 解析失败
                 consecutive_failures += 1
                 current_step = current_step.model_copy(
                     update={
@@ -307,12 +325,9 @@ class Agent:
             consecutive_failures = 0
 
             if parsed_content.final_answer is not None:
-                # 4b. 终结答案
                 try:
-                    # 确保 final_answer 是 JSON 字符串
                     json.loads(parsed_content.final_answer)
                 except Exception:
-                    # 如果不是 JSON 字符串，则包装，以确保最终返回格式
                     parsed_content.final_answer = json.dumps(
                         {"result": parsed_content.final_answer}
                     )
@@ -328,7 +343,6 @@ class Agent:
                 break
 
             elif parsed_content.tool_call is not None:
-                # 4c. 工具调用
                 tool_result = await self._execute_tool(parsed_content.tool_call)
                 observation_content = (
                     tool_result.output
@@ -337,7 +351,6 @@ class Agent:
                 )
                 status = "SUCCESS" if tool_result.success else "FAILED"
 
-                # 更新状态
                 current_step = current_step.model_copy(
                     update={"observation": observation_content, "status": status}
                 )
@@ -352,17 +365,20 @@ class Agent:
                     f"Tool '{parsed_content.tool_call.name}' executed at step {state.iteration}, status: {status}"
                 )
 
-        # 5. 循环结束处理
-        save_history(state.history)  # 保存最终历史
+        save_history(state.history)
 
         if state.final_answer:
             print(f"\n[DONE] Task completed in {state.iteration} steps.")
             return state.final_answer
 
-        # 异常退出或最大步数
         history_summary = self._format_history_for_debug(state.history)
+        error_message = (
+            state.error
+            or f"Agent reached maximum steps ({self.max_steps}) or consecutive failures ({consecutive_failures}) without final answer."
+        )
+
         error_details = {
-            "error": f"Agent reached maximum steps ({self.max_steps}) or consecutive failures ({consecutive_failures}) without final answer.",
+            "error": error_message,
             "last_state_history": history_summary,
         }
         write_log(f"Max steps/consecutive failures reached. Returning error JSON.")
