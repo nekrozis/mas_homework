@@ -11,3 +11,4 @@ wheels/
 agent.log
 data/test.pdf
 data/test2.pdf
+agent_history.json

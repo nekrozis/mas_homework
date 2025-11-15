@@ -1,27 +1,28 @@
 # src/mas_homework/tools/pdf_tools.py
 import json
-import os
-from typing import Any, Dict, Union
+from pathlib import Path
+from typing import Any, Dict
 
-import fitz
+import fitz  # PyMuPDF
 
 from ..tool_system import GLOBAL_TOOLS, tool
-from ..types import ToolResult # 假设 ToolResult 在 types.py 中定义为 TypedDict
+from ..types import ToolResult
 
 # ==============================================================================
-# PDF 文件工具定义
+# PDF 文件工具定义 (修复 njoin 错误)
 # ==============================================================================
 
 
 @tool(
     GLOBAL_TOOLS,
-    "pdfread",
-    "Read a specific page from a PDF file. E.g., path='name.pdf', page=1",
+    "pdf_read",
+    "Read a specific page from a PDF file. Parameter 'page' is 1-indexed. Returns the first 10 lines as a snippet. E.g., path='name.pdf', page=1",
 )
-def pdfread(path: str, page: int = 1) -> ToolResult:
+def pdf_read(path: str, page: int = 1) -> ToolResult:
     """读取 PDF 文件指定页面的内容，仅返回前十行作为摘要。"""
-    if not os.path.exists(path) or not path.lower().endswith(".pdf"):
-        # 使用 ToolResult 构造函数
+    pdf_path = Path(path)
+
+    if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
         return ToolResult(
             success=False,
             output=None,
@@ -29,29 +30,29 @@ def pdfread(path: str, page: int = 1) -> ToolResult:
         )
 
     try:
-        doc = fitz.open(path)
-        if page < 1 or page > doc.page_count:
+        doc = fitz.open(pdf_path.as_posix())
+
+        doc_page_count = doc.page_count
+        internal_page_index = page - 1
+
+        if page < 1 or page > doc_page_count:
             doc.close()
-            # 使用 ToolResult 构造函数
             return ToolResult(
                 success=False,
                 output=None,
-                error=f"Page {page} out of range. Document has {doc.page_count} pages.",
+                error=f"Page {page} out of range. Document has {doc_page_count} pages.",
             )
 
-        # 使用 "text" 模式
-        raw_output = doc.load_page(page - 1).get_text("text")
+        raw_output = doc.load_page(internal_page_index).get_text("text")
         text: str = str(raw_output)
         doc.close()
 
-        # 确保 text 是字符串，splitlines 方法就可以安全访问
         snippet: str = "\n".join(text.splitlines()[:10])
 
-        output: str = f"Content of page {page} in '{path}' (Snippet):\n{snippet}..."
-        # 使用 ToolResult 构造函数
+        output: str = f"Content of page {page} in '{path}' (Total {len(text.splitlines())} lines. Snippet):\n{snippet}\n..."
         return ToolResult(success=True, output=output, error=None)
+
     except Exception as e:
-        # 使用 ToolResult 构造函数
         return ToolResult(
             success=False,
             output=None,
@@ -61,13 +62,63 @@ def pdfread(path: str, page: int = 1) -> ToolResult:
 
 @tool(
     GLOBAL_TOOLS,
+    "pdf_text",
+    "Extract all text content from a PDF file. Use this ONLY if partial reading is insufficient, as output can be very large. E.g., path='report.pdf'",
+)
+def pdf_text(path: str) -> ToolResult:
+    """提取整个 PDF 文件的所有文本内容。"""
+    pdf_path = Path(path)
+
+    if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
+        return ToolResult(
+            success=False,
+            output=None,
+            error=f"Invalid or non-existent PDF file: '{path}'",
+        )
+
+    full_text = []
+    try:
+        doc = fitz.open(pdf_path.as_posix())
+        for i in range(doc.page_count):
+            page_text = doc.load_page(i).get_text("text")
+            full_text.append(page_text)
+
+        doc.close()
+
+        # 🚀 修复点: 将 njoin 改为 join
+        output = "\n".join(full_text)
+        # ---------------------------
+
+        # 限制返回长度，避免输出过大导致 LLM 记忆溢出
+        MAX_TEXT_LEN = 10000
+        if len(output) > MAX_TEXT_LEN:
+            # 使用 doc.page_count 之前确保 doc 没有被意外关闭或异常终止
+            page_count_display = doc.page_count if "doc" in locals() else "N/A"
+            output = (
+                output[:MAX_TEXT_LEN]
+                + f"\n\n[TRUNCATED] Text content was truncated to {MAX_TEXT_LEN} characters. Total pages: {page_count_display}."
+            )
+
+        return ToolResult(success=True, output=output, error=None)
+
+    except Exception as e:
+        return ToolResult(
+            success=False,
+            output=None,
+            error=f"Error extracting full text from PDF: {type(e).__name__}: {e}",
+        )
+
+
+@tool(
+    GLOBAL_TOOLS,
     "pdf_meta",
-    "Extract structured metadata (Title, Author, Abstract snippet) from a PDF file. E.g., path='test.pdf'",
+    "Extract structured metadata (Title, Author, Creation Date, Page Count, and first page snippet) from a PDF file. E.g., path='test.pdf'",
 )
 def pdf_meta(path: str) -> ToolResult:
-    """从 PDF 文件中提取真实的元数据（标题、作者、创建日期、第一页摘要）。"""
-    if not os.path.exists(path) or not path.lower().endswith(".pdf"):
-        # 使用 ToolResult 构造函数
+    """从 PDF 文件中提取元数据。返回一个结构化的 JSON 字符串。"""
+    pdf_path = Path(path)
+
+    if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
         return ToolResult(
             success=False,
             output=None,
@@ -75,7 +126,7 @@ def pdf_meta(path: str) -> ToolResult:
         )
 
     try:
-        doc = fitz.open(path)
+        doc = fitz.open(pdf_path.as_posix())
 
         # 1. 提取文档元数据
         metadata: Dict[str, Any] = doc.metadata or {}
@@ -85,12 +136,13 @@ def pdf_meta(path: str) -> ToolResult:
         raw_output = doc.load_page(0).get_text("text")
         first_page_text: str = str(raw_output)
 
+        # 提取前 20 行作为摘要片段
         abstract_snippet: str = "\n".join(first_page_text.splitlines()[:20])
 
         doc.close()
 
         # 3. 构造结构化输出
-        meta_data_output: Dict[str, Union[str, int]] = {
+        meta_data_output: Dict[str, Any] = {
             "file": path,
             "title": metadata.get("title", "N/A"),
             "author": metadata.get("author", "N/A"),
@@ -100,11 +152,9 @@ def pdf_meta(path: str) -> ToolResult:
         }
 
         output_json: str = json.dumps(meta_data_output, ensure_ascii=False, indent=4)
-        # 使用 ToolResult 构造函数
         return ToolResult(success=True, output=output_json, error=None)
 
     except Exception as e:
-        # 使用 ToolResult 构造函数
         return ToolResult(
             success=False,
             output=None,
