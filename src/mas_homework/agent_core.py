@@ -24,7 +24,7 @@ MAX_LOG_LENGTH = 1000  # LLM 输出日志截断长度
 
 
 def write_log(message: str):
-    """写入带时间戳的日志文件，并限制长度"""
+    """写入带时间戳的日志，并限制长度"""
     timestamp = datetime.datetime.now().isoformat()
     if len(message) > MAX_LOG_LENGTH:
         message = message[:MAX_LOG_LENGTH] + "..."
@@ -33,13 +33,13 @@ def write_log(message: str):
 
 
 def load_history() -> List[StepRecord]:
-    """从文件加载历史记录，实现长期记忆"""
+    """从文件加载历史记录"""
     if HISTORY_FILE.exists():
         try:
             data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
             return [StepRecord.model_validate(d) for d in data]
         except Exception as e:
-            write_log(f"Error loading history from {HISTORY_FILE}: {e}")
+            write_log(f"Error loading history: {e}")
             return []
     return []
 
@@ -52,7 +52,7 @@ def save_history(history: List[StepRecord]):
             encoding="utf-8",
         )
     except Exception as e:
-        write_log(f"Error saving history to {HISTORY_FILE}: {e}")
+        write_log(f"Error saving history: {e}")
 
 
 class Agent:
@@ -67,7 +67,7 @@ class Agent:
         self.tool_system = tool_system
         self.max_steps = max_steps
         self.model = model
-        self.max_consecutive_failures = 3  # 连续解析失败退出限制
+        self.max_consecutive_failures = 3
         write_log(f"\n--- New Agent Session Initialized (Model: {model}) ---")
 
     def _format_history_for_debug(
@@ -94,37 +94,30 @@ class Agent:
         return debug_history
 
     def _get_system_prompt(self) -> str:
-        """生成严格 ReAct 模式的系统提示词"""
+        """生成严格 ReAct 模式的系统提示"""
         tool_desc = self.tool_system.get_tool_descriptions()
         return (
             "You are a ReAct-style document analysis agent. Each step MUST produce a single JSON object.\n"
-            "STRICTLY OUTPUT ONLY JSON. NO OTHER TEXT, COMMENTS, OR MARKDOWN.\n"
-            "1. 'thought': what you are thinking (MANDATORY).\n"
-            "2. **MUTUALLY EXCLUSIVE**: EITHER 'tool_call' (to get new info) OR 'final_answer' (to conclude), NOT both.\n"
-            "\nTool call structure:\n"
-            '{"name": "...", "arguments": {...}}\n'
-            "Final answer must be a string containing a complete JSON object.\n"
-            "Always output your Thought even before calling a tool.\n"
+            "STRICTLY OUTPUT ONLY JSON.\n"
+            "1. 'thought': mandatory.\n"
+            "2. MUTUALLY EXCLUSIVE: EITHER 'tool_call' OR 'final_answer'.\n"
             f"\nAvailable tools:\n{tool_desc}\n"
             "\nExample Tool Call:\n"
             '  {"thought": "I need to find files.", "tool_call": {"name": "ls", "arguments": {"path_or_pattern": "*.pdf"}}}\n'
             "\nExample Final Answer:\n"
-            '  {"thought": "I have gathered all data.", "final_answer": "{ "summary": "Final result goes here" }"\n'
-            "\nDO NOT include any 'finish' tool. Use the 'final_answer' key to conclude."
+            '  {"thought": "I have gathered all data.", "final_answer": "{ "summary": "Final result goes here" }"}\n'
+            "Use 'final_answer' to conclude."
         )
 
     def _format_messages(self, state: AgentState) -> List[Dict[str, str]]:
-        """将 AgentState 转换为 LLM 接口所需的 message 格式"""
+        """将 AgentState 转换为 LLM 接口消息格式"""
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": self._get_system_prompt()},
         ]
 
-        # 构造历史记录消息 (包括上一次对话的记忆)
         for step in state.history:
             if step.thought:
                 llm_content: Dict[str, Any] = {"thought": step.thought}
-
-                # 构造 LLM (assistant) 的输出
                 if step.tool_name:
                     llm_content["tool_call"] = {
                         "name": step.tool_name,
@@ -132,12 +125,10 @@ class Agent:
                     }
                 elif step.status == "COMPLETED" and state.final_answer:
                     llm_content["final_answer"] = state.final_answer
-
                 messages.append(
                     {"role": "assistant", "content": json.dumps(llm_content)}
                 )
 
-            # 构造工具结果 (tool_result) 的观察
             if step.observation and step.status != "COMPLETED":
                 observation_message = (
                     f"Tool Observation (Status: {step.status}, Tool: {step.tool_name}):\n"
@@ -145,64 +136,47 @@ class Agent:
                 )
                 messages.append({"role": "user", "content": observation_message})
 
-        # 当前用户查询
         messages.append({"role": "user", "content": state.user_query})
         return messages
 
     def _parse_llm_response(
         self, llm_response: LLMResponse
     ) -> Tuple[LLMParsedContent, Optional[str]]:
-        """使用正则匹配解析 LLM 响应，提高鲁棒性，并校验互斥结构"""
+        """解析 LLM 响应，提取 JSON 并校验互斥字段"""
         raw_content = llm_response.message.content or ""
         write_log(f"LLM Raw Output: {raw_content}")
 
-        # 使用正则尝试提取第一个最外层 JSON 对象
-        # re.DOTALL 确保匹配能跨越多行，这是解决 boundary parse fail 的关键
         match = re.search(r"\{.*\}", raw_content, re.DOTALL)
         if not match:
-            return LLMParsedContent(
-                thought="Error"
-            ), "Failed to find valid JSON boundaries."
+            return LLMParsedContent(thought="Error"), "Failed to find valid JSON."
 
         json_payload = match.group(0)
-
         try:
             data = json.loads(json_payload)
-            # 依赖 types.py 中的 LLMParsedContent 校验互斥性
             parsed_content = LLMParsedContent.model_validate(data)
-
-            # types.py 已经做了互斥校验，这里只检查 thought 是否存在
             if not parsed_content.thought:
-                return parsed_content, "JSON missing mandatory 'thought' field."
-
+                return parsed_content, "Missing mandatory 'thought' field."
             return parsed_content, None
-
         except json.JSONDecodeError as e:
-            return LLMParsedContent(thought="Error"), f"Failed to parse JSON: {e}"
+            return LLMParsedContent(thought="Error"), f"JSON parse failed: {e}"
         except ValidationError as e:
-            return LLMParsedContent(thought="Error"), f"Validation Error: {e}"
+            return LLMParsedContent(thought="Error"), f"Validation error: {e}"
         except Exception as e:
             return LLMParsedContent(
                 thought="Error"
-            ), f"Unexpected parsing error: {type(e).__name__}: {e}"
+            ), f"Unexpected error: {type(e).__name__}: {e}"
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
-        """执行工具调用，并增加人工确认步骤"""
+        """执行工具调用并确认"""
         tool_name = tool_call.name
         tool_args = tool_call.arguments
 
-        # 1. 人工确认
-        print(
-            f"\n[CONFIRM] Agent suggests executing tool '{tool_name}' with args {tool_args}."
-        )
-        confirm = input(f"Confirm execution? (y/n): ")
+        print(f"\n[CONFIRM] Execute tool '{tool_name}' with args {tool_args}?")
+        confirm = input("Confirm? (y/n): ")
         if confirm.lower() != "y":
-            write_log(f"Tool execution '{tool_name}' cancelled by user.")
-            return ToolResult(
-                success=False, output=None, error="Tool execution cancelled by user."
-            )
+            write_log(f"Tool '{tool_name}' cancelled by user.")
+            return ToolResult(success=False, output=None, error="Cancelled by user.")
 
-        # 2. 实际执行
         if tool_name not in self.tool_system.tools:
             return ToolResult(
                 success=False, output=None, error=f"Unknown tool: '{tool_name}'"
@@ -213,15 +187,14 @@ class Agent:
                 result = ToolResult(
                     success=False,
                     output=None,
-                    error=f"Tool '{tool_name}' returned invalid structure.",
+                    error=f"Invalid return from '{tool_name}'",
                 )
-
             write_log(f"Tool '{tool_name}' executed. Success: {result.success}")
             return result
         except Exception as e:
             write_log(f"Tool '{tool_name}' execution failed: {type(e).__name__}: {e}")
             return ToolResult(
-                success=False, output=None, error=f"Tool execution exception: {e}"
+                success=False, output=None, error=f"Execution exception: {e}"
             )
 
     async def run(self, user_query: str) -> str:
@@ -237,45 +210,34 @@ class Agent:
         while state.iteration < self.max_steps and state.final_answer is None:
             state = state.model_copy(update={"iteration": state.iteration + 1})
 
+            # 检测工具调用循环，避免重复执行
             if state.iteration > 2 and len(state.history) >= 2:
                 last_entry = state.history[-1]
-                prev_entry = state.history[-2]
-
-                last_call = last_entry.tool_call
-                prev_call = prev_entry.tool_call
-
-                is_call_repeated_successfully = (
-                    last_call
-                    and prev_call
-                    and last_call.name == prev_call.name
-                    and last_call.arguments == prev_call.arguments
-                    and last_entry.status == "SUCCESS"
-                )
-
-                if is_call_repeated_successfully:
-                    state = state.model_copy(
-                        update={
-                            "error": f"Agent repeated tool call '{last_call.name}' after SUCCESS. Loop detected."
-                        }
-                    )
-                    write_log(
-                        f"LOOP DETECTED (SUCCESS): Tool call '{last_call.name}' repeated consecutively after SUCCESS. Aborting."
-                    )
-                    break
+                if last_entry.status == "SUCCESS" and last_entry.tool_name:
+                    prev_entry = state.history[-2]
+                    if (
+                        last_entry.tool_name == prev_entry.tool_name
+                        and last_entry.tool_args == prev_entry.tool_args
+                    ):
+                        state = state.model_copy(
+                            update={
+                                "error": f"Repeated tool call '{last_entry.tool_name}' detected."
+                            }
+                        )
+                        write_log(
+                            f"LOOP DETECTED: '{last_entry.tool_name}' repeated. Aborting."
+                        )
+                        break
 
             messages = self._format_messages(state)
-
             print(f"\n[AGENT] Step {state.iteration}. Thinking...")
 
             try:
-                # 2. 调用 LLM
                 llm_response = await self.llm_client.chat(
                     self.model, messages, format="json"
                 )
             except Exception as e:
-                error_obs = (
-                    f"LLM client call failed: {type(e).__name__}: {str(e)[:500]}"
-                )
+                error_obs = f"LLM call failed: {type(e).__name__}: {str(e)[:500]}"
                 current_step = StepRecord(
                     iteration=state.iteration,
                     thought="LLM call failed.",
@@ -289,7 +251,6 @@ class Agent:
                 break
 
             parsed_content, parse_error = self._parse_llm_response(llm_response)
-
             print(f"[Thought] {parsed_content.thought}")
 
             current_step = StepRecord(
@@ -345,19 +306,15 @@ class Agent:
             elif parsed_content.tool_call is not None:
                 tool_result = await self._execute_tool(parsed_content.tool_call)
                 observation_content = (
-                    tool_result.output
-                    or tool_result.error
-                    or "Tool returned no output/error."
+                    tool_result.output or tool_result.error or "No output/error."
                 )
                 status = "SUCCESS" if tool_result.success else "FAILED"
-
                 current_step = current_step.model_copy(
                     update={"observation": observation_content, "status": status}
                 )
                 state = state.model_copy(
                     update={"history": state.history + [current_step]}
                 )
-
                 print(
                     f"[Observation] Status: {status}, Output: {observation_content[:100]}..."
                 )
@@ -374,12 +331,8 @@ class Agent:
         history_summary = self._format_history_for_debug(state.history)
         error_message = (
             state.error
-            or f"Agent reached maximum steps ({self.max_steps}) or consecutive failures ({consecutive_failures}) without final answer."
+            or f"Max steps ({self.max_steps}) or consecutive failures ({consecutive_failures}) reached without final answer."
         )
-
-        error_details = {
-            "error": error_message,
-            "last_state_history": history_summary,
-        }
-        write_log(f"Max steps/consecutive failures reached. Returning error JSON.")
+        error_details = {"error": error_message, "last_state_history": history_summary}
+        write_log("Max steps/consecutive failures reached. Returning error JSON.")
         return json.dumps(error_details, indent=4, ensure_ascii=False)
